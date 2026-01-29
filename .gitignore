@@ -1,0 +1,5 @@
+venv
+_pychache_
+*.pyc
+*.gif
+gif_overlay_config.json
