@@ -5,15 +5,13 @@ on:
     branches: [ main ]
   workflow_dispatch:
 
-strategy:
-  matrix:
-    os: [ubuntu-latest, windows-latest]
-
 jobs:
   build:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
@@ -35,5 +33,5 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: python-executable
+          name: python-executable-${{ matrix.os }}
           path: dist/*
