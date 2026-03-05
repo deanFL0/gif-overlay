@@ -9,66 +9,49 @@ from PySide6.QtWidgets import (
     QPushButton,
     QFrame,
     QFileDialog,
-    QMessageBox,
 )
-from PySide6.QtGui import QPixmap, QMovie, QPainter, QColor, QBrush, QCursor
+from PySide6.QtGui import QPixmap, QMovie, QPainter, QColor, QBrush
 from PySide6.QtCore import Qt, Signal, QTimer, QSize, QRect
 import os
 import sys
 import json
 
-class GifWorker(QtCore.QThread):
-    """Worker thread to handle GIF playback."""
-    frameReady = Signal(QPixmap)
-    error = Signal(str)
-    
-    def __init__(self, gif_path: str):
-        super().__init__()
-        self.gif_path = gif_path
-        self._stopped = False
-        self.movie = None
-        
-    def run(self):
-        """Start decoding the GIF"""
-        self.movie = QMovie(self.gif_path)
-        self.movie.setCacheMode(QMovie.CacheAll)
-        if not self.movie.isValid():
-            self.error.emit("Invalid or unsupported GIF file.")
-            return
-        
-        self.movie.frameChanged.connect(self._on_frame_changed)
-        self.movie.start()
-        
-        # Event loop to keep the thread alive
-        self.loop = QtCore.QEventLoop()
-        self.movie.finished.connect(self.loop.quit)
-        self.loop.exec()
-        
-    def _on_frame_changed(self, frame_number):
-        if self._stopped:
-            self.movie.stop()
-            QtCore.QMetaObject.invokeMethod(
-                self.loop, "quit", Qt.QueuedConnection
-            )
-            return
-
-        pix = self.movie.currentPixmap()
-        self.frameReady.emit(pix)
-        
-    def stop(self):
-        """Stop the worker thread."""
-        self._stopped = True
-        self.quit()
-        self.wait()
-
 class GifWindow(QWidget):
-    """A window that displays GIF frames received from a background thread."""
+    """A window that displays GIF frames."""
     
-    def __init__(self, gif_path: str):
+    # Add signals for window state changes
+    windowClosed = Signal(str, dict)  # Emits path and window state when closed
+    windowMoved = Signal(str, dict)   # Emits path and window state when moved
+    windowResized = Signal(str, dict) # Emits path and window state when resized
+    
+    def __init__(self, gif_path: str, saved_state=None):
         super().__init__()
+        
+        # Set this FIRST, before anything else
+        self._is_destroyed = False
+        
         self.setWindowTitle("GIF Preview")
-        self.setGeometry(200, 200, 400, 400)
+        
+        # Store the GIF path
         self.gif_path = gif_path
+        
+        # Load saved state or use defaults
+        if saved_state:
+            self._current_size = QSize(
+                saved_state.get("width", 400),
+                saved_state.get("height", 400)
+            )
+            initial_pos = QtCore.QPoint(
+                saved_state.get("x", 200),
+                saved_state.get("y", 200)
+            )
+        else:
+            self._current_size = QSize(400, 400)
+            initial_pos = QtCore.QPoint(200, 200)
+        
+        self.setGeometry(initial_pos.x(), initial_pos.y(), 
+                        self._current_size.width(), self._current_size.height())
+        
         self.drag_position = None
         self.is_resizing = False
         self.resize_start_pos = None
@@ -76,9 +59,8 @@ class GifWindow(QWidget):
         self.is_focused = False
         
         # Fixed size - prevent auto-resizing
-        self._current_size = QSize(400, 400)
         self._min_size = QSize(100, 100)
-        self._max_size = QSize(2000, 2000)  # Set a reasonable maximum
+        self._max_size = QSize(2000, 2000)
         
         # make window transparent
         self.setWindowFlags(QtCore.Qt.FramelessWindowHint | QtCore.Qt.WindowStaysOnTopHint)
@@ -104,50 +86,102 @@ class GifWindow(QWidget):
         layout.addWidget(self.label)
         
         # Set central widget to fill the window
-        self.central_widget.setGeometry(0, 0, 400, 400)
+        self.central_widget.setGeometry(0, 0, self._current_size.width(), self._current_size.height())
         
         # Resize handle area
         self.resize_handle_size = 20
         
-        # start the worker thread
-        self.worker = GifWorker(gif_path)
-        self.worker.frameReady.connect(self.update_frame)
-        self.worker.error.connect(self.show_error)
-        self.worker.start()
+        # Set up QMovie directly in the main thread
+        self.movie = None
+        self.current_pixmap = None
+        self.load_movie(gif_path)
         
         # Update timer for smooth resizing
         self.update_timer = QTimer()
         self.update_timer.setSingleShot(True)
         self.update_timer.timeout.connect(self.update_gif_size)
         
-    def update_frame(self, pixmap: QPixmap):
-        """Display new frame from the worker thread."""
-        # Store the original pixmap for scaling
-        self.current_pixmap = pixmap
-        self.update_gif_size()
+        # Timer for debouncing window state updates
+        self.state_update_timer = QTimer()
+        self.state_update_timer.setSingleShot(True)
+        self.state_update_timer.timeout.connect(self.emit_window_state)
+        
+    def load_movie(self, gif_path):
+        """Load and start the movie."""
+        try:
+            self.movie = QMovie(gif_path)
+            self.movie.setCacheMode(QMovie.CacheAll)
+            
+            if not self.movie.isValid():
+                self.label.setText("Invalid or unsupported GIF file.")
+                return
+            
+            self.movie.frameChanged.connect(self.update_frame)
+            self.movie.start()
+        except Exception as e:
+            self.label.setText(f"Error loading GIF: {str(e)}")
+        
+    def get_window_state(self):
+        """Return current window state as dictionary."""
+        return {
+            "x": self.x(),
+            "y": self.y(),
+            "width": self.width(),
+            "height": self.height()
+        }
     
-    def show_error(self, msg: str):
-        """Display error message."""
-        self.label.setText(msg)
+    def emit_window_state(self):
+        """Emit signal with current window state."""
+        # Check if window is still valid
+        if hasattr(self, '_is_destroyed') and not self._is_destroyed:
+            try:
+                self.windowMoved.emit(self.gif_path, self.get_window_state())
+            except RuntimeError:
+                # Widget might be deleted
+                pass
+    
+    def update_frame(self, frame_number):
+        """Display new frame from QMovie."""
+        # Check if window is still valid
+        if not hasattr(self, '_is_destroyed') or self._is_destroyed:
+            return
+            
+        if not self.movie:
+            return
+            
+        try:
+            pix = self.movie.currentPixmap()
+            if not pix.isNull():
+                self.current_pixmap = pix
+                self.update_gif_size()
+        except RuntimeError:
+            # Widget might be deleted
+            pass
     
     def _update_border(self):
         """Update border based on focus state."""
-        if self.is_focused:
-            # Set a fixed border without causing layout changes
-            self.central_widget.setStyleSheet("""
-                QWidget#central_widget {
-                    background-color: transparent;
-                    border: 2px solid #0078d4;
-                    border-radius: 2px;
-                }
-            """)
-        else:
-            self.central_widget.setStyleSheet("""
-                QWidget#central_widget {
-                    background-color: transparent;
-                    border: none;
-                }
-            """)
+        if not hasattr(self, '_is_destroyed') or self._is_destroyed:
+            return
+            
+        try:
+            if self.is_focused:
+                self.central_widget.setStyleSheet("""
+                    QWidget#central_widget {
+                        background-color: transparent;
+                        border: 2px solid #0078d4;
+                        border-radius: 2px;
+                    }
+                """)
+            else:
+                self.central_widget.setStyleSheet("""
+                    QWidget#central_widget {
+                        background-color: transparent;
+                        border: none;
+                    }
+                """)
+        except RuntimeError:
+            # Widget might be deleted
+            pass
     
     def focusInEvent(self, event):
         """Handle focus in event."""
@@ -162,138 +196,214 @@ class GifWindow(QWidget):
         super().focusOutEvent(event)
         
     def closeEvent(self, event):
-        """Stop thread cleanly on window close."""
-        if hasattr(self, 'worker') and self.worker.isRunning():
-            self.worker.stop()
+        """Clean up on window close."""
+        self._is_destroyed = True
+        
+        # Stop all timers
+        if hasattr(self, 'update_timer') and self.update_timer:
+            try:
+                self.update_timer.stop()
+            except:
+                pass
+        if hasattr(self, 'state_update_timer') and self.state_update_timer:
+            try:
+                self.state_update_timer.stop()
+            except:
+                pass
+        
+        # Stop the movie
+        if hasattr(self, 'movie') and self.movie:
+            try:
+                self.movie.frameChanged.disconnect()
+            except:
+                pass
+            try:
+                self.movie.stop()
+                self.movie.deleteLater()
+            except:
+                pass
+            self.movie = None
+        
+        # Emit final window state before closing
+        try:
+            self.windowClosed.emit(self.gif_path, self.get_window_state())
+        except:
+            pass
+        
         super().closeEvent(event)
         
     def mousePressEvent(self, event):
         """Handle mouse press for dragging or resizing."""
-        self.setFocus()
-        
-        pos = event.position().toPoint()
-        window_rect = self.rect()
-        
-        # Check if clicking in resize handle (bottom-right corner)
-        resize_rect = QRect(
-            window_rect.width() - self.resize_handle_size,
-            window_rect.height() - self.resize_handle_size,
-            self.resize_handle_size,
-            self.resize_handle_size
-        )
-        
-        if resize_rect.contains(pos):
-            self.is_resizing = True
-            self.resize_start_pos = event.globalPosition().toPoint()
-            self.resize_start_size = self.size()
-            self.drag_position = None  # Clear drag position when resizing
-            self.setCursor(Qt.SizeFDiagCursor)
-        elif event.button() == Qt.LeftButton:
-            self.drag_position = event.globalPosition().toPoint() - self.frameGeometry().topLeft()
-            self.setCursor(Qt.ArrowCursor)
+        if not hasattr(self, '_is_destroyed') or self._is_destroyed:
+            return
+            
+        try:
+            self.setFocus()
+            
+            pos = event.position().toPoint()
+            window_rect = self.rect()
+            
+            # Check if clicking in resize handle (bottom-right corner)
+            resize_rect = QRect(
+                window_rect.width() - self.resize_handle_size,
+                window_rect.height() - self.resize_handle_size,
+                self.resize_handle_size,
+                self.resize_handle_size
+            )
+            
+            if resize_rect.contains(pos):
+                self.is_resizing = True
+                self.resize_start_pos = event.globalPosition().toPoint()
+                self.resize_start_size = self.size()
+                self.drag_position = None
+                self.setCursor(Qt.SizeFDiagCursor)
+            elif event.button() == Qt.LeftButton:
+                self.drag_position = event.globalPosition().toPoint() - self.frameGeometry().topLeft()
+                self.setCursor(Qt.ArrowCursor)
+        except RuntimeError:
+            pass
         
     def mouseMoveEvent(self, event):
         """Handle mouse move for dragging or resizing."""
-        pos = event.position().toPoint()
-        window_rect = self.rect()
-        
-        # Check if in resize area
-        resize_rect = QRect(
-            window_rect.width() - self.resize_handle_size,
-            window_rect.height() - self.resize_handle_size,
-            self.resize_handle_size,
-            self.resize_handle_size
-        )
-        
-        # Update cursor when hovering over resize handle
-        if resize_rect.contains(pos):
-            self.setCursor(Qt.SizeFDiagCursor)
-        else:
-            self.setCursor(Qt.ArrowCursor)
-        
-        # Handle resizing
-        if self.is_resizing and event.buttons() == Qt.LeftButton:
-            delta = event.globalPosition().toPoint() - self.resize_start_pos
-            new_width = min(
-                self._max_size.width(), 
-                max(self._min_size.width(), self.resize_start_size.width() + delta.x())
-            )
-            new_height = min(
-                self._max_size.height(), 
-                max(self._min_size.height(), self.resize_start_size.height() + delta.y())
+        if not hasattr(self, '_is_destroyed') or self._is_destroyed:
+            return
+            
+        try:
+            pos = event.position().toPoint()
+            window_rect = self.rect()
+            
+            # Check if in resize area
+            resize_rect = QRect(
+                window_rect.width() - self.resize_handle_size,
+                window_rect.height() - self.resize_handle_size,
+                self.resize_handle_size,
+                self.resize_handle_size
             )
             
-            # Update size
-            self._current_size = QSize(new_width, new_height)
-            self.resize(self._current_size)
+            # Update cursor when hovering over resize handle
+            if resize_rect.contains(pos):
+                self.setCursor(Qt.SizeFDiagCursor)
+            else:
+                self.setCursor(Qt.ArrowCursor)
             
-            # Update central widget to fill the window
-            self.central_widget.setGeometry(0, 0, new_width, new_height)
-            
-            # Trigger delayed update of GIF size
-            if not self.update_timer.isActive():
-                self.update_timer.start(50)
-            
-        # Handle dragging
-        elif event.buttons() == Qt.LeftButton and self.drag_position is not None:
-            self.move(event.globalPosition().toPoint() - self.drag_position)
+            # Handle resizing
+            if self.is_resizing and event.buttons() == Qt.LeftButton:
+                delta = event.globalPosition().toPoint() - self.resize_start_pos
+                new_width = min(
+                    self._max_size.width(), 
+                    max(self._min_size.width(), self.resize_start_size.width() + delta.x())
+                )
+                new_height = min(
+                    self._max_size.height(), 
+                    max(self._min_size.height(), self.resize_start_size.height() + delta.y())
+                )
+                
+                # Update size
+                self._current_size = QSize(new_width, new_height)
+                self.resize(self._current_size)
+                
+                # Update central widget to fill the window
+                self.central_widget.setGeometry(0, 0, new_width, new_height)
+                
+                # Trigger delayed update of GIF size
+                if not self.update_timer.isActive():
+                    self.update_timer.start(50)
+                
+                # Emit resize signal with debouncing
+                self.state_update_timer.start(100)
+                
+            # Handle dragging
+            elif event.buttons() == Qt.LeftButton and self.drag_position is not None:
+                self.move(event.globalPosition().toPoint() - self.drag_position)
+                # Emit move signal with debouncing
+                self.state_update_timer.start(100)
+        except RuntimeError:
+            pass
     
     def mouseReleaseEvent(self, event):
         """Handle mouse release."""
-        self.is_resizing = False
-        self.drag_position = None
+        if not hasattr(self, '_is_destroyed') or self._is_destroyed:
+            return
+            
+        try:
+            self.is_resizing = False
+            self.drag_position = None
+            
+            # Emit final state immediately on mouse release
+            self.emit_window_state()
+        except RuntimeError:
+            pass
     
     def resizeEvent(self, event):
         """Handle resize event."""
-        new_size = event.size()
-        self._current_size = new_size
-        
-        # Update central widget to fill the entire window
-        self.central_widget.setGeometry(0, 0, new_size.width(), new_size.height())
-        
-        # Update GIF size if we have a pixmap
-        if hasattr(self, 'current_pixmap'):
-            self.update_gif_size()
-        
-        super().resizeEvent(event)
+        if not hasattr(self, '_is_destroyed') or self._is_destroyed:
+            return
+            
+        try:
+            new_size = event.size()
+            self._current_size = new_size
+            
+            # Update central widget to fill the entire window
+            self.central_widget.setGeometry(0, 0, new_size.width(), new_size.height())
+            
+            # Update GIF size if we have a pixmap
+            if hasattr(self, 'current_pixmap') and self.current_pixmap:
+                self.update_gif_size()
+            
+            super().resizeEvent(event)
+        except RuntimeError:
+            pass
     
     def update_gif_size(self):
         """Update GIF size based on current window size."""
-        if hasattr(self, 'current_pixmap') and hasattr(self, 'label'):
-            # Get the available size (accounting for border if focused)
-            available_size = self.central_widget.size()
-            if self.is_focused:
-                available_size -= QSize(4, 4)  # Account for border width
+        if not hasattr(self, '_is_destroyed') or self._is_destroyed:
+            return
             
-            scaled_pix = self.current_pixmap.scaled(
-                available_size,
-                Qt.KeepAspectRatio,
-                Qt.SmoothTransformation,
-            )
-            self.label.setPixmap(scaled_pix)
+        try:
+            if hasattr(self, 'current_pixmap') and self.current_pixmap and hasattr(self, 'label'):
+                # Get the available size (accounting for border if focused)
+                available_size = self.central_widget.size()
+                if self.is_focused:
+                    available_size -= QSize(4, 4)  # Account for border width
+                
+                scaled_pix = self.current_pixmap.scaled(
+                    available_size,
+                    Qt.KeepAspectRatio,
+                    Qt.SmoothTransformation,
+                )
+                self.label.setPixmap(scaled_pix)
+        except RuntimeError:
+            # Widget might be deleted
+            pass
     
     def paintEvent(self, event):
         """Paint resize handle indicator."""
-        super().paintEvent(event)
-        
-        if self.is_focused:
-            painter = QPainter(self)
-            painter.setRenderHint(QPainter.Antialiasing)
+        if not hasattr(self, '_is_destroyed') or self._is_destroyed:
+            return
             
-            # Draw resize handle indicator only when focused
-            painter.setBrush(QBrush(QColor(0, 120, 212, 150)))
-            painter.setPen(Qt.NoPen)
+        try:
+            super().paintEvent(event)
             
-            # Draw triangle in bottom-right corner
-            size = self.size()
-            points = [
-                QtCore.QPoint(size.width(), size.height() - self.resize_handle_size),
-                QtCore.QPoint(size.width() - self.resize_handle_size, size.height()),
-                QtCore.QPoint(size.width(), size.height())
-            ]
-            painter.drawPolygon(points)
-            
-            painter.end()
+            if self.is_focused:
+                painter = QPainter(self)
+                painter.setRenderHint(QPainter.Antialiasing)
+                
+                # Draw resize handle indicator only when focused
+                painter.setBrush(QBrush(QColor(0, 120, 212, 150)))
+                painter.setPen(Qt.NoPen)
+                
+                # Draw triangle in bottom-right corner
+                size = self.size()
+                points = [
+                    QtCore.QPoint(size.width(), size.height() - self.resize_handle_size),
+                    QtCore.QPoint(size.width() - self.resize_handle_size, size.height()),
+                    QtCore.QPoint(size.width(), size.height())
+                ]
+                painter.drawPolygon(points)
+                
+                painter.end()
+        except RuntimeError:
+            pass
 
 class MainWindow(QtWidgets.QMainWindow):
     CONFIG_FILE = "gif_overlay_config.json"
@@ -329,13 +439,31 @@ class MainWindow(QtWidgets.QMainWindow):
         window_layout.addWidget(scroll_area)
         window_layout.addWidget(add_row_button)
 
-        self.gif_windows = {}
+        self.gif_windows = {}  # Maps label -> window
+        self.window_states = {}  # Maps path -> window state
         self.gif_paths = []
         
         # initial row
         self.load_gif_config()
+        
+        # Connect application aboutToQuit signal to save config
+        app = QtWidgets.QApplication.instance()
+        app.aboutToQuit.connect(self.cleanup_and_save)
 
-    def add_row(self):
+    def cleanup_and_save(self):
+        """Clean up all windows and save config before quitting."""
+        # Close all GIF windows
+        for label, window in list(self.gif_windows.items()):
+            try:
+                window.close()
+            except:
+                pass
+        self.gif_windows.clear()
+        
+        # Save final config
+        self.save_gif_config()
+
+    def add_row(self, gif_path=None):
         """Add more GIF management row."""
         row_frame = QFrame()
         row_frame.setFrameShape(QFrame.Box)
@@ -374,18 +502,31 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.main_layout.insertWidget(self.main_layout.count() - 1, row_frame)
 
-        return row_layout
+        # If a path was provided, set it up
+        if gif_path and os.path.exists(gif_path):
+            pixmap = QPixmap(gif_path)
+            self.set_scaled_pixmap(image_preview, pixmap)
+            image_preview.file_path = gif_path
+            image_preview.setToolTip(gif_path)
+
+        return image_preview
 
     def remove_row(self, row_frame, image_preview):
         """Remove a GIF management row."""
         # close gif window if open
         if image_preview in self.gif_windows:
-            self.gif_windows[image_preview].close()
+            gif_window = self.gif_windows[image_preview]
+            path = getattr(image_preview, "file_path", None)
+            if path and path in self.window_states:
+                del self.window_states[path]
+            gif_window.close()
             del self.gif_windows[image_preview]
 
         path = getattr(image_preview, "file_path", None)
         if path and path in self.gif_paths:
             self.gif_paths.remove(path)
+            if path in self.window_states:
+                del self.window_states[path]
             self.save_gif_config()
         self.main_layout.removeWidget(row_frame)
         row_frame.deleteLater()
@@ -404,7 +545,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 image_preview.setToolTip(path)
 
                 #save path to config
-                self.gif_paths.append(path)
+                if path not in self.gif_paths:
+                    self.gif_paths.append(path)
                 self.save_gif_config()
 
     def set_scaled_pixmap(self, label, pixmap):
@@ -433,51 +575,99 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         
         if image_preview in self.gif_windows:
+            # Just close the window - the on_gif_window_closed handler will handle cleanup
             self.gif_windows[image_preview].close()
-            del self.gif_windows[image_preview]
             button.setText("Show GIF")
         else:
-            gif_win = GifWindow(path)
+            # Get saved state for this GIF if it exists
+            saved_state = self.window_states.get(path)
+            gif_win = GifWindow(path, saved_state)
+            
+            # Connect signals with proper parameter handling
+            def make_closed_handler(img_label, btn):
+                def handler(path, state):
+                    self.on_gif_window_closed(path, img_label, btn, state)
+                return handler
+            
+            gif_win.windowClosed.connect(make_closed_handler(image_preview, button))
+            gif_win.windowMoved.connect(self.on_gif_window_moved)
+            gif_win.windowResized.connect(self.on_gif_window_resized)
+            
             gif_win.show()
             self.gif_windows[image_preview] = gif_win
             button.setText("Close GIF")
+    
+    def on_gif_window_closed(self, path, label, button, state):
+        """Handle GIF window closed."""
+        # Update stored state with the final state from the window
+        self.window_states[path] = state
+        self.save_gif_config()
+        
+        # Remove from tracking dictionary
+        if label in self.gif_windows:
+            del self.gif_windows[label]
+        
+        # Update button text
+        button.setText("Show GIF")
+    
+    def on_gif_window_moved(self, path, state):
+        """Handle GIF window moved."""
+        self.window_states[path] = state
+        # Debounced saving - use a timer to avoid too many writes
+        if hasattr(self, '_save_timer'):
+            self._save_timer.stop()
+        else:
+            self._save_timer = QTimer()
+            self._save_timer.setSingleShot(True)
+            self._save_timer.timeout.connect(self.save_gif_config)
+        self._save_timer.start(500)  # Save after 500ms of no movement
+    
+    def on_gif_window_resized(self, path, state):
+        """Handle GIF window resized."""
+        self.window_states[path] = state
+        # Use same debouncing as move
+        if hasattr(self, '_save_timer'):
+            self._save_timer.stop()
+        else:
+            self._save_timer = QTimer()
+            self._save_timer.setSingleShot(True)
+            self._save_timer.timeout.connect(self.save_gif_config)
+        self._save_timer.start(500)  # Save after 500ms of no resizing
         
     def save_gif_config(self):
-        """Save GIF data to config file."""
+        """Save GIF data and window states to config file."""
         try:
+            config_data = {
+                "gif_paths": self.gif_paths,
+                "window_states": self.window_states
+            }
             with open(self.CONFIG_FILE, "w", encoding="utf-8") as f:
-                json.dump({"gif_paths": self.gif_paths}, f, indent=4)
+                json.dump(config_data, f, indent=4)
         except Exception as e:
             print(f"Error saving config: {e}")
 
     def load_gif_config(self):
         """Load GIF config from a config file."""
-
         if not os.path.exists(self.CONFIG_FILE):
             self.add_row()
             return
         
         try:
             with open(self.CONFIG_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                self.gif_paths = data.get("gif_paths", [])
+                config_data = json.load(f)
+                self.gif_paths = config_data.get("gif_paths", [])
+                self.window_states = config_data.get("window_states", {})
             
-            #Add rows for each saved gif path
+            # Add rows for each saved gif path
             for gif_path in self.gif_paths:
-                #Only add row if file exists
+                # Only add row if file exists
                 if os.path.exists(gif_path):
-                    self.add_row()
-                    labels = self.content_widget.findChildren(QLabel)
-                    if labels:
-                        last_label = labels[-1]
-                        pixmap = QPixmap(gif_path)
-                        self.set_scaled_pixmap(last_label, pixmap)
-                        last_label.file_path = gif_path
-                        last_label.setToolTip(gif_path)
+                    self.add_row(gif_path)
+                    
         except Exception as e:
             print(f"Error loading config: {e}")
-            self.add_row() #Fallback
-        
+            self.add_row()  # Fallback
+
 if __name__ == "__main__":
     app = QApplication([])
     window = MainWindow()
